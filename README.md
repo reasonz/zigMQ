@@ -1,409 +1,163 @@
-# ZigMQ: 极简消息队列 + 发布订阅
+# ZigMQ
 
-> 用 Zig 语言实现的轻量级消息队列服务，支持队列和发布/订阅两种模式。当前版本聚焦于多连接可用性、明确的队列满语义和更稳健的内存管理。
+[简体中文](README.zh-CN.md)
 
-## 目录
+ZigMQ is a lightweight in-memory message queue and pub/sub server written in Zig. It ships as a single binary, uses a small text protocol, and is designed for fast local deployment, predictable behavior, and straightforward hacking.
 
-1. [设计文档](#1-设计文档)
-2. [开发调试过程](#2-开发调试过程)
-3. [使用说明](#3-使用说明)
-4. [理论性能指标](#4-理论性能指标)
+## Why ZigMQ
 
----
+- One server, two messaging patterns: point-to-point queues and pub/sub topics.
+- Single binary, no external service dependency, easy to drop into scripts, prototypes, and internal tools.
+- Sharded queue/topic locking with snapshot-based fanout, so hot paths stay simple and safe.
+- Clear queue-full semantics, explicit error responses, and automatic queue growth up to a configured ceiling.
+- Built-in unit, protocol, stress, and benchmark harnesses for safe iteration.
 
-## 1. 设计文档
+## What It Does Well
 
-### 1.1 核心目标
+| Area | ZigMQ advantage |
+| --- | --- |
+| Deployment | One binary, one port, zero extra infrastructure |
+| Protocol | Human-readable text protocol that is easy to test with `nc`, `telnet`, or raw sockets |
+| Messaging | FIFO queues plus pub/sub topics in the same process |
+| Performance model | Low-allocation hot paths, auto-growing ring buffers, sharded state locks |
+| Operability | Simple `PING`, `INFO`, `QUEUES`, `TOPICS`, `SUBS` commands |
+| Developer experience | Modular Zig codebase and repeatable regression scripts |
 
-| 目标 | 描述 |
-|------|------|
-| **代码极简** | 单文件实现，保持结构紧凑 |
-| **部署极简** | 单二进制文件，零外部依赖 |
-| **上手极简** | 5 分钟即可熟练使用 |
-| **模式融合** | 队列与发布/订阅和谐共存 |
+## Install
 
-### 1.2 数据结构
+### Option 1: Use a release package
 
-#### Ring Buffer（环形缓冲区）
+Release assets are published as:
 
-采用固定容量数组实现 FIFO 队列：
+- `zigmq-v0.4.0-linux-x86_64.tar.gz`
+- `zigmq-v0.4.0-macos-aarch64.tar.gz`
+- `SHA256SUMS.txt`
 
-```zig
-const RingBuffer = struct {
-    messages: []Message,
-    capacity: usize,   // 固定容量
-    head: usize = 0,   // 读指针
-    tail: usize = 0,   // 写指针
-    len: usize = 0,    // 当前长度
-    allocator: mem.Allocator,
-};
-```
+Extract the archive and run `./zigmq`.
 
-**优势：**
-- O(1) 的入队/出队操作
-- 预分配连续内存，零动态分配碎片
-- 无 GC 停顿，内存布局紧凑
+### Option 2: Build from source
 
-#### Message（消息结构）
+Requirements:
 
-```zig
-const Message = struct {
-    id: u64,              // 全局唯一 ID
-    body: []u8,           // 消息体（独立分配）
-    timestamp: i64,        // 时间戳
-};
-```
-
-### 1.3 协议设计
-
-采用类 Memcached 的极简文本协议。
-
-#### 命令格式
-```
-COMMAND [ARG1] [ARG2]\r\n
-```
-
-#### 响应格式
-```
-成功: +OK\r\n
-错误: -ERR <message>\r\n
-消息: $<length>\r\n<Body>\r\n
-发布: +<topic>:<message>\r\n
-```
-
-### 1.4 统一命令集
-
-| 命令 | 格式 | 说明 | 别名 |
-|------|------|------|------|
-| **队列操作** ||||
-| `send` | `send <queue> <msg>` | 发送消息到队列 | PUSH |
-| `recv` | `recv <queue>` | 接收/弹出消息 | POP |
-| `peek` | `peek <queue>` | 查看队列头部 | PEEK |
-| `len` | `len <queue>` | 队列长度 | LEN |
-| `queues` | `queues` | 列出所有队列 | QUEUES |
-| `mq` | `mq <queue>` | 创建队列 | QCREATE |
-| **发布/订阅** ||||
-| `sub` | `sub <topic>` | 订阅主题 | SUB |
-| `unsub` | `unsub [topic]` | 取消订阅（省略=全部） | UNSUB |
-| `pub` | `pub <topic> <msg>` | 发布消息 | PUB |
-| `topics` | `topics` | 列出所有主题 | TOPICS |
-| `subs` | `subs` | 查看当前订阅列表 | SUBS |
-| **系统** ||||
-| `ping` | `ping` | 心跳检测 | PING |
-| `info` | `info` | 服务器信息 | INFO |
-
-### 1.5 架构设计
-
-当前实现补充说明：
-
-- 命令大小写不敏感，`ping` / `PING` / `PiNg` 都可用
-- 连接模型为“每连接一个线程 + queue/topic 分离锁”
-- 队列在写满时会按 2x 自动扩容，直到 `max_queue_capacity`
-- 队列默认溢出策略为 `reject`，满队列时返回 `-ERR queue full`
-- `PUB` 会先快照订阅者列表，再在锁外广播，避免慢订阅者长时间占住全局状态锁
-- 全局消息 ID 使用原子自增，避免所有生产者争用同一把 ID 锁
-- `peek` / `topics` / `queues` / `subs` 的响应不再依赖固定大小缓冲
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      ZigMQ Server                           │
-│                                                             │
-│  ┌─────────┐    ┌─────────────────┐    ┌──────────────┐  │
-│  │ Listener│───>│ ConnectionHandler│───>│CommandDispatch│  │
-│  └─────────┘    └─────────────────┘    └───────┬───────┘  │
-│                                                │           │
-│                        ┌───────────────────────┼───────────┤
-│                        ▼                       ▼           │
-│              ┌─────────────────┐    ┌─────────────────┐   │
-│              │   QueueManager   │    │  TopicManager   │   │
-│              │   (HashMap)      │    │   (HashMap)     │   │
-│              └────────┬─────────┘    └────────┬────────┘   │
-│                       │                       │             │
-│        ┌──────────────┼───────────────┬──────┘             │
-│        ▼              ▼               ▼                     │
-│  ┌──────────┐  ┌──────────┐   ┌──────────────┐            │
-│  │ Queue A  │  │ Queue B  │   │ Topic: news  │            │
-│  │ [RB]     │  │ [RB]     │   │  ├─ Conn-A   │            │
-│  └──────────┘  └──────────┘   │  ├─ Conn-B   │            │
-│                                │  └─ Conn-C   │            │
-│                                └──────────────┘            │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 1.6 发布/订阅特性
-
-- **多端订阅**：多个客户端可同时订阅同一主题
-- **广播发布**：发布消息自动广播给所有订阅者
-- **主题无需创建**：`PUB` 自动创建主题，零配置
-- **自动清理**：连接断开时自动移除所有订阅
-- **消息格式**：`+<topic>:<message>` 前缀便于解析来源
-
----
-
-## 2. 开发调试过程
-
-### 2.1 环境问题与解决
-
-#### Zig 版本兼容性
-
-**问题：** Zig 0.16.0-dev 版本标准库不稳定，`std.net` 模块不存在。
-
-**解决：**
-```bash
-curl -L https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz -o /tmp/zig-0.15.2.tar.xz
-tar -xf /tmp/zig-0.15.2.tar.xz -C /tmp
-/tmp/zig-aarch64-macos-0.15.2/zig build
-```
-
-### 2.2 核心 Bug 排查
-
-#### Bug 1: StringHashMap 键查找失败
-
-**现象：** PUSH 成功后 LEN 报错 queue not found。
-
-**根因：** StringHashMap 要求键内存有效，Command 解析出的 `[]const u8` 指向临时 buffer。
-
-**解决：** 在 QueueManager.getOrCreate 中先复制键字符串：
-```zig
-const name_copy = try allocator.dupe(u8, name);
-try queues.put(name_copy, queue);
-```
-
-#### Bug 2: TCP 流协议数据覆盖
-
-**现象：** PUSH 成功但 PEEK 数据错位。
-
-**根因：** Message.body 指向 connection buffer，但 buffer 会被后续命令覆盖。
-
-**解决：** Message 存储独立分配的数据副本。
-
-#### Bug 3: UNSUB 命令误删订阅者
-
-**现象：** SUB 成功后 topics 显示订阅数为 0。
-
-**根因：** UNSUB 处理中错误调用 `removeSubscriberAll(conn)` 从所有主题移除订阅者。
-
-**解决：** 改为只从指定主题移除。
-
-### 2.3 Zig 0.15 API 变化
-
-| 旧 API | 新 API |
-|--------|--------|
-| `std.ArrayList(T).init()` | `std.ArrayList(T).empty` |
-| `arrayList.append(item)` | `arrayList.append(allocator, item)` |
-| `arrayList.deinit()` | `arrayList.deinit(allocator)` |
-
----
-
-## 3. 使用说明
-
-### 3.1 安装
+- Zig `0.15.2`
 
 ```bash
-# 克隆项目
-git clone <repo>
+git clone https://github.com/reasonz/zigMQ.git
 cd zigMQ
-
-# 需要 Zig 0.15.2
-zig version
-
-# 构建
-zig build
-
-# 运行单元测试
-zig build test
-
+zig build -Doptimize=ReleaseFast
 ./zig-out/bin/zigmq
 ```
 
-### 3.2 启动
+## Quick Start
+
+Start the server:
 
 ```bash
-# 默认配置（端口 6379）
-./zig-out/bin/zigmq
-
-# 自定义端口
-./zig-out/bin/zigmq --port 8080
-
-# 小队列 + 自动扩容上限
-./zig-out/bin/zigmq --capacity 1024 --max-capacity 16384
+./zig-out/bin/zigmq --port 6379 --capacity 1024 --max-capacity 16384
 ```
 
-### 3.3 队列操作
+Queue example:
 
-```python
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.connect(('localhost', 6379))
+```text
+send jobs hello world
++OK
 
-def cmd(c):
-    s.sendall(c.encode() + b'\r\n')
-    return s.recv(1024).decode().strip()
+peek jobs
+$11
+hello world
 
-# 发送消息
-cmd("send q1 hello")      # +OK
-
-# 查看长度
-cmd("len q1")             # +1
-
-# 接收消息
-cmd("recv q1")            # $5\r\nhello
-
-# 队列会自动扩容；达到 max-capacity 后才会显式报错
-# cmd("send q1 overflow")  # -ERR queue full
-
-# 列出队列
-cmd("queues")            # +q1
+recv jobs
+$11
+hello world
 ```
 
-### 3.4 发布/订阅
+Pub/Sub example:
 
-```python
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.connect(('localhost', 6379))
-
-def cmd(c):
-    s.sendall(c.encode() + b'\r\n')
-    return s.recv(1024).decode().strip()
-
-# 订阅主题
-cmd("sub news")          # +OK
-cmd("sub tech")          # +OK
-
-# 查看订阅
-cmd("subs")              # +news\r\ntech
-
-# 查看所有主题
-cmd("topics")            # +news(1)\r\ntech(1)
-
-# 发布消息（所有订阅者都会收到）
-cmd("pub news Hello")    # +news:Hello\r\n+OK 1
-```
-
-### 3.5 交互示例
-
-```bash
-# 终端 A - 订阅者
-$ nc localhost 6379
+```text
 sub news
 +OK
-+news:Zig 1.0 released!    # 收到发布的消息
 
-# 终端 B - 发布者
-$ nc localhost 6379
-pub news Zig 1.0 released!
-+news:Zig 1.0 released!
-+OK 1                       # 1 个订阅者收到
+pub news shipped
++news:shipped
++OK 1
 ```
 
-### 3.6 协议详解
+## Command Reference
 
-#### SUB - 订阅主题
+| Command | Example | Description |
+| --- | --- | --- |
+| `send <queue> <msg>` | `send jobs hello` | Push a message into a queue |
+| `recv <queue>` | `recv jobs` | Pop the next message from a queue |
+| `peek <queue>` | `peek jobs` | Read the head message without removing it |
+| `len <queue>` | `len jobs` | Get queue length |
+| `mq <queue>` | `mq jobs` | Create a queue explicitly |
+| `queues` | `queues` | List queues |
+| `sub <topic>` | `sub news` | Subscribe current connection to a topic |
+| `unsub [topic]` | `unsub news` | Unsubscribe one topic or all subscriptions |
+| `pub <topic> <msg>` | `pub news shipped` | Broadcast to topic subscribers |
+| `topics` | `topics` | List active topics and subscriber counts |
+| `subs` | `subs` | List subscriptions for the current connection |
+| `ping` | `ping` | Health check |
+| `info` | `info` | Server version and capacity info |
 
-```
-请求:  SUB <topic>\r\n
-响应:  +OK\r\n
-```
+Protocol response shapes:
 
-#### UNSUB - 取消订阅
+- Success: `+OK\r\n`
+- Error: `-ERR <message>\r\n`
+- Bulk message: `$<length>\r\n<body>\r\n`
+- Broadcast: `+<topic>:<message>\r\n`
 
-```
-请求:  UNSUB [topic]\r\n
-响应:  +OK\r\n
-（省略 topic 则取消所有订阅）
-```
+## Quality Gates
 
-#### PUB - 发布消息
-
-```
-请求:  PUB <topic> <message>\r\n
-响应:  +<topic>:<message>\r\n   # 广播给所有订阅者
-       +OK <count>\r\n          # 发布者确认，count=订阅者数量
-```
-
-#### TOPICS - 列出主题
-
-```
-请求:  TOPICS\r\n
-响应:  +<topic1>(<count1>)\r\n<topic2>(<count2>)\r\n...
-```
-
-#### INFO - 查看当前容量策略
-
-```
-请求:  INFO\r\n
-响应:  +ZigMQ 0.3.0\r\n
-       queues:<count>\r\n
-       topics:<count>\r\n
-       initial_capacity:<n>\r\n
-       max_capacity:<n>\r\n
+```bash
+zig build test
+zig build protocol-test
+zig build stress-test
+zig build benchmark
 ```
 
----
+What they cover:
 
-## 4. 理论性能指标
+- `test`: unit coverage for queue, connection, pub/sub, and server internals
+- `protocol-test`: end-to-end correctness for queue, pub/sub, pipelining, and cleanup semantics
+- `stress-test`: concurrent regression scenarios
+- `benchmark`: local throughput baseline harness
 
-说明：当前仓库没有提交正式 benchmark 脚本和基准数据，下面的内容只能看作复杂度层面的直觉估计，不应该拿来替代真实压测结论。
+## Performance Baseline
 
-### 4.1 延迟分析
+Representative local baseline on April 4, 2026:
 
-```
-单次 Ring Buffer 操作延迟（最佳情况，L1 缓存命中）:
-  - 指令数：~20-30 条 CPU 指令
-  - 耗时：~10-30 ns（3GHz 处理器）
+- Machine: Apple Silicon macOS
+- Zig: `0.15.2`
+- Build: `ReleaseFast`
+- Transport: loopback TCP
+- Command: `zig build benchmark`
 
-端到端请求延迟（包含网络，本地 loopback）:
-  - TCP 握手      : ~200-500 ns
-  - 数据复制      : ~100-200 ns (64B)
-  - 命令解析      : ~50-100 ns
-  - Ring Buffer   : ~50-100 ns
-  - 响应发送      : ~100-200 ns
-  总计：~500-1100 ns / 请求
-```
+| Scenario | Result |
+| --- | --- |
+| `queue_contention` | `45,659 ops/s`, `21.9 us/op` |
+| `independent_queue_roundtrips` | `46,002 ops/s`, `21.7 us/op` |
+| `pubsub_fanout publish_rate` | `12,765 msg/s` |
+| `pubsub_fanout delivery_rate` | `76,589 deliveries/s` |
 
-### 4.2 吞吐量预测
+These numbers are intended as a practical local baseline, not a formal lab benchmark. They are most useful for comparing changes across commits on the same machine.
 
-| 场景 | 预估 QPS | 说明 |
-|------|----------|------|
-| Echo (64B) | 50-80 万/s | CPU + 网络受限 |
-| PUSH (1KB) | 30-50 万/s | 内存带宽受限 |
-| POP (1KB) | 30-50 万/s | 同上 |
-| PUB (广播) | 取决于订阅者数量 | O(n) 复杂度 |
+## Release Workflow
 
-### 4.3 内存占用（粗略估算）
+Build release archives:
 
-```
-固定 Ring Buffer（10,000 条 × 1KB/条）: 10 MB
-Topic subscribers 指针数组: 可忽略
-进程基础开销: < 1 MB
----------------------------------
-总计: 取决于消息体大小、连接数和主题数量
+```bash
+python3 scripts/package_release.py
 ```
 
-### 4.4 与 Redis 的关系
+Publish the GitHub release:
 
-| 指标 | ZigMQ | Redis (单线程) | 说明 |
-|------|-------|----------------|------|
-| **定位** | 教学 / 原型 / 小工具 | 生产级数据结构服务器 | ZigMQ 追求小而直白 |
-| **并发模型** | 每连接一线程 | 单线程事件循环 | 取舍完全不同 |
-| **可靠性** | 当前为内存态 | 更成熟 | ZigMQ 还在演进 |
-| **生态能力** | 极少 | 很丰富 | 不应直接替代 Redis |
+```bash
+python3 scripts/publish_release.py
+```
 
----
+The package script writes release artifacts to `dist/release/` and produces `SHA256SUMS.txt`.
 
-## 5. 未来规划
+## Project Status
 
-- [ ] AOF 持久化
-- [ ] 内存 + 磁盘分层（内存队列溢写到磁盘）
-- [ ] 多 Worker 分片
-- [ ] 阻塞式 POP/Recv
-- [ ] 简单监控端点
-- [ ] 配置文件支持
-- [ ] 交叉编译（Linux static）
-
----
-
-## 6. 许可证
-
-MIT License
+ZigMQ is a compact, high-signal messaging server for learning, internal tools, automation backends, and early-stage product infrastructure. It is not trying to out-feature Redis or NATS; it is trying to stay small, understandable, and fast enough to be genuinely useful.
