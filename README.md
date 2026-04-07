@@ -84,6 +84,47 @@ pub news shipped
 +OK 1
 ```
 
+## Python SDK
+
+If you want to use ZigMQ from Python, install the official SDK from PyPI:
+
+```bash
+pip install zigmq
+```
+
+Repository:
+
+- [reasonz/zigMQ-python-SDK](https://github.com/reasonz/zigMQ-python-SDK)
+
+Queue example:
+
+```python
+from zigmq import Client
+
+with Client() as mq:
+    mq.send("jobs", "hello world")
+    print(mq.peek("jobs"))
+    print(mq.recv("jobs"))
+```
+
+Pub/Sub example:
+
+```python
+from zigmq import Client, Subscriber
+
+with Subscriber() as sub:
+    sub.subscribe("news")
+
+    with Client() as mq:
+        delivered = mq.publish("news", "shipped")
+        print(delivered)
+
+    event = sub.get(timeout=1.0)
+    print(event.topic, event.message)
+```
+
+The SDK connects to `127.0.0.1:8388` by default, which matches the current ZigMQ server default port.
+
 ## Command Reference
 
 | Command | Example | Description |

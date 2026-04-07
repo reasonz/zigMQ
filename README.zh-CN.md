@@ -84,6 +84,47 @@ pub news shipped
 +OK 1
 ```
 
+## Python SDK
+
+如果你希望在 Python 里使用 ZigMQ，可以直接通过 PyPI 安装官方 SDK：
+
+```bash
+pip install zigmq
+```
+
+仓库地址：
+
+- [reasonz/zigMQ-python-SDK](https://github.com/reasonz/zigMQ-python-SDK)
+
+队列示例：
+
+```python
+from zigmq import Client
+
+with Client() as mq:
+    mq.send("jobs", "hello world")
+    print(mq.peek("jobs"))
+    print(mq.recv("jobs"))
+```
+
+发布订阅示例：
+
+```python
+from zigmq import Client, Subscriber
+
+with Subscriber() as sub:
+    sub.subscribe("news")
+
+    with Client() as mq:
+        delivered = mq.publish("news", "shipped")
+        print(delivered)
+
+    event = sub.get(timeout=1.0)
+    print(event.topic, event.message)
+```
+
+SDK 默认会连接 `127.0.0.1:8388`，和当前 ZigMQ 服务端默认端口保持一致。
+
 ## 命令速查
 
 | 命令 | 示例 | 说明 |
