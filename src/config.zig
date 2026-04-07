@@ -3,7 +3,7 @@ const fmt = std.fmt;
 const mem = std.mem;
 
 pub const Config = struct {
-    port: u16 = 6379,
+    port: u16 = 8388,
     mode: enum { standalone, master, worker } = .standalone,
     workers: u32 = 1,
     queue_capacity: usize = 10000,
@@ -20,7 +20,7 @@ pub fn parseArgs() Config {
     while (args.next()) |arg| {
         if (mem.eql(u8, arg, "--port")) {
             if (args.next()) |value| {
-                config.port = fmt.parseInt(u16, value, 10) catch 6379;
+                config.port = fmt.parseInt(u16, value, 10) catch 8388;
             }
         } else if (mem.eql(u8, arg, "--workers")) {
             if (args.next()) |value| {

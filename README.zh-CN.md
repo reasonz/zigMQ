@@ -29,8 +29,8 @@ ZigMQ 是一个使用 Zig 编写的轻量级内存消息队列与发布订阅服
 
 当前 release 资产包含：
 
-- `zigmq-v0.4.0-linux-x86_64.tar.gz`
-- `zigmq-v0.4.0-macos-aarch64.tar.gz`
+- `zigmq-v0.4.1-linux-x86_64.tar.gz`
+- `zigmq-v0.4.1-macos-aarch64.tar.gz`
 - `SHA256SUMS.txt`
 
 下载解压后直接运行 `./zigmq` 即可。
@@ -53,8 +53,10 @@ zig build -Doptimize=ReleaseFast
 启动服务：
 
 ```bash
-./zig-out/bin/zigmq --port 6379 --capacity 1024 --max-capacity 16384
+./zig-out/bin/zigmq --port 8388 --capacity 1024 --max-capacity 16384
 ```
+
+默认端口已经调整为 `8388`，所以如果你直接运行 `./zig-out/bin/zigmq`，服务也会监听在 `8388`，除非你用 `--port` 显式覆盖。
 
 队列示例：
 

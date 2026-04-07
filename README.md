@@ -29,8 +29,8 @@ ZigMQ is a lightweight in-memory message queue and pub/sub server written in Zig
 
 Release assets are published as:
 
-- `zigmq-v0.4.0-linux-x86_64.tar.gz`
-- `zigmq-v0.4.0-macos-aarch64.tar.gz`
+- `zigmq-v0.4.1-linux-x86_64.tar.gz`
+- `zigmq-v0.4.1-macos-aarch64.tar.gz`
 - `SHA256SUMS.txt`
 
 Extract the archive and run `./zigmq`.
@@ -53,8 +53,10 @@ zig build -Doptimize=ReleaseFast
 Start the server:
 
 ```bash
-./zig-out/bin/zigmq --port 6379 --capacity 1024 --max-capacity 16384
+./zig-out/bin/zigmq --port 8388 --capacity 1024 --max-capacity 16384
 ```
+
+The default port is `8388`, so `./zig-out/bin/zigmq` also listens on `8388` unless you override it with `--port`.
 
 Queue example:
 
