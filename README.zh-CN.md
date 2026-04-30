@@ -8,7 +8,7 @@ ZigMQ 是一个使用 Zig 编写的轻量级内存消息队列与发布订阅服
 
 - 一个服务同时支持两种消息模式：队列和发布订阅。
 - 单二进制、零外部依赖，部署成本低，上手快。
-- 队列和主题都做了分片锁，发布路径采用订阅者快照广播，并发边界更清晰。
+- 队列和主题都做了分片管理，队列操作采用无锁 CAS 算法，发布路径采用订阅者快照广播，并发性能更好。
 - 队列容量支持自动扩容，并且对“队列满”有明确可预期的错误语义。
 - 自带单测、协议回归、并发压力测试和 benchmark 脚手架，便于持续优化。
 
@@ -29,8 +29,8 @@ ZigMQ 是一个使用 Zig 编写的轻量级内存消息队列与发布订阅服
 
 当前 release 资产包含：
 
-- `zigmq-v0.4.1-linux-x86_64.tar.gz`
-- `zigmq-v0.4.1-macos-aarch64.tar.gz`
+- `zigmq-v0.5.0-linux-x86_64.tar.gz`
+- `zigmq-v0.5.0-macos-aarch64.tar.gz`
 - `SHA256SUMS.txt`
 
 下载解压后直接运行 `./zigmq` 即可。
@@ -168,22 +168,36 @@ zig build benchmark
 
 ## 性能指标
 
-以下数据来自 2026 年 4 月 4 日本地基线测试：
+以下数据来自 2026 年 4 月 30 日本地基线测试（v0.5.0）：
 
 - 机器：Apple Silicon macOS
 - Zig：`0.15.2`
-- 构建模式：`ReleaseFast`
+- 构建模式：`Debug`（开发基线）
 - 网络：本机 loopback TCP
 - 命令：`zig build benchmark`
 
 | 场景 | 结果 |
 | --- | --- |
-| `queue_contention` | `45,659 ops/s`，`21.9 us/op` |
-| `independent_queue_roundtrips` | `46,002 ops/s`，`21.7 us/op` |
-| `pubsub_fanout publish_rate` | `12,765 msg/s` |
-| `pubsub_fanout delivery_rate` | `76,589 deliveries/s` |
+| `queue_contention` | `64,000 ops/s`，`15.6 us/op` |
+| `independent_queue_roundtrips` | `42,700 ops/s`，`23.4 us/op` |
+| `pubsub_fanout publish_rate` | `9,100 msg/s` |
+| `pubsub_fanout delivery_rate` | `91,500 deliveries/s` |
+| `pipelined_send` | `1,580,000 msg/s`，`0.6 us/op` |
+| `pipelined_recv` | `1,350,000 msg/s`，`0.7 us/op` |
 
-这些数据更适合作为“同一台机器、同一套脚本下的版本对比基线”，而不是严格的实验室 benchmark。
+这些数据更适合作为”同一台机器、同一套脚本下的版本对比基线”，而不是严格的实验室 benchmark。流水线吞吐量展示了服务端处理能力（~1.5M msg/s），同步场景受限于 Python 客户端 TCP 往返延迟。
+
+## 变更日志
+
+### v0.5.0 (2026-04-30)
+
+- **无锁队列**：用基于 CAS 的无锁 MPMC 环形缓冲区算法替换互斥锁队列操作，队列热路径不再串行化
+- **分配器修复**：将 `smp_allocator`（固定大小线性分配器）替换为 `GeneralPurposeAllocator`，防止长时间运行 OOM
+- **写缓冲**：新增连接级写缓冲和响应批处理，减少 TCP 系统调用并支持协议流水线
+- **命令分发优化**：用预解析的 `Operation` 枚举替换基于字符串的命令匹配，加速命令分发
+- **消息内联存储**：≤32 字节的消息直接内联存储在环形缓冲区中，无需堆分配
+- **协议修复**：修复 INFO 响应缓冲区溢出、`broadcastSnapshot` 返回值类型等问题
+- **最小容量约束**：环形缓冲区最小容量设为 2，确保无锁序列算法的正确性
 
 ## 打包与发布
 

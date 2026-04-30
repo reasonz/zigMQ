@@ -9,7 +9,10 @@ const server_mod = @import("server.zig");
 const version = @import("version.zig");
 
 pub fn main() !void {
-    const allocator = std.heap.page_allocator;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
     const app_config = config.parseArgs();
 
     var server = try server_mod.Server.init(allocator, app_config);

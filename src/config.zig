@@ -29,7 +29,7 @@ pub fn parseArgs() Config {
         } else if (mem.eql(u8, arg, "--capacity")) {
             if (args.next()) |value| {
                 config.queue_capacity = fmt.parseInt(usize, value, 10) catch 10000;
-                if (config.queue_capacity == 0) config.queue_capacity = 10000;
+                if (config.queue_capacity < 2) config.queue_capacity = 10000;
             }
         } else if (mem.eql(u8, arg, "--max-capacity")) {
             if (args.next()) |value| {

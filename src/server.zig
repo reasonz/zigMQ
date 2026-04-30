@@ -13,7 +13,6 @@ const version = @import("version.zig");
 
 const Config = config_mod.Config;
 const Command = protocol.Command;
-const isOp = protocol.isOp;
 const Message = queue_mod.Message;
 const Queue = queue_mod.Queue;
 const Connection = connection_mod.Connection;
@@ -112,11 +111,11 @@ const ShardedQueueManager = struct {
     ) QueuePushResult {
         const shard = self.shardFor(name);
         shard.mutex.lock();
-        defer shard.mutex.unlock();
-
         const queue = shard.manager.getOrCreate(name, capacity, max_capacity) catch {
+            shard.mutex.unlock();
             return .create_failed;
         };
+        shard.mutex.unlock();
 
         queue.push(allocator, msg) catch |err| switch (err) {
             error.QueueFull => return .queue_full,
@@ -130,35 +129,42 @@ const ShardedQueueManager = struct {
     fn pop(self: *ShardedQueueManager, name: []const u8) QueuePopResult {
         const shard = self.shardFor(name);
         shard.mutex.lock();
-        defer shard.mutex.unlock();
+        const queue = shard.manager.queues.get(name) orelse {
+            shard.mutex.unlock();
+            return .queue_not_found;
+        };
+        shard.mutex.unlock();
 
-        const queue = shard.manager.queues.get(name) orelse return .queue_not_found;
-        if (queue.buffer.pop()) |msg| return .{ .message = msg };
+        if (queue.pop()) |msg| return .{ .message = msg };
         return .empty;
     }
 
     fn peekCopy(self: *ShardedQueueManager, allocator: mem.Allocator, name: []const u8) QueuePeekResult {
         const shard = self.shardFor(name);
         shard.mutex.lock();
-        defer shard.mutex.unlock();
+        const queue = shard.manager.queues.get(name) orelse {
+            shard.mutex.unlock();
+            return .queue_not_found;
+        };
+        shard.mutex.unlock();
 
-        const queue = shard.manager.queues.get(name) orelse return .queue_not_found;
-        if (queue.buffer.peek()) |msg| {
-            const body_copy = allocator.dupe(u8, msg.body) catch return .out_of_memory;
-            return .{ .body = body_copy };
-        }
-        return .empty;
+        const body = queue.peekCopy(allocator) catch |err| switch (err) {
+            error.Empty => return .empty,
+            error.OutOfMemory => return .out_of_memory,
+        };
+        return .{ .body = body };
     }
 
     fn len(self: *ShardedQueueManager, name: []const u8) ?usize {
         const shard = self.shardFor(name);
         shard.mutex.lock();
-        defer shard.mutex.unlock();
+        const queue = shard.manager.queues.get(name) orelse {
+            shard.mutex.unlock();
+            return null;
+        };
+        shard.mutex.unlock();
 
-        if (shard.manager.queues.get(name)) |queue| {
-            return queue.buffer.len;
-        }
-        return null;
+        return queue.len();
     }
 
     fn ensureQueue(self: *ShardedQueueManager, name: []const u8, capacity: usize, max_capacity: usize) bool {
@@ -311,12 +317,6 @@ const SharedState = struct {
     }
 };
 
-var global_msg_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
-
-fn nextMsgId() u64 {
-    return global_msg_id.fetchAdd(1, .monotonic) + 1;
-}
-
 pub const Server = struct {
     allocator: mem.Allocator,
     state: SharedState,
@@ -370,14 +370,21 @@ pub const Server = struct {
 
             const raw = line orelse break;
             const trimmed = mem.trimRight(u8, raw, "\r");
-            if (trimmed.len == 0) continue;
+            if (trimmed.len == 0) {
+                if (conn.isResponseBatching()) try conn.endResponse(conn.hasBufferedLine());
+                continue;
+            }
 
+            const has_more_input = conn.hasBufferedLine();
+            if (has_more_input or conn.isResponseBatching()) conn.beginResponse(has_more_input);
             const cmd = Command.parse(trimmed) catch {
-                try conn.write("-ERR invalid command\r\n");
+                try conn.writeBuffered("-ERR invalid command\r\n");
+                if (has_more_input or conn.isResponseBatching()) try conn.endResponse(conn.hasBufferedLine());
                 continue;
             };
 
             try self.handleCommand(conn, cmd);
+            if (has_more_input or conn.isResponseBatching()) try conn.endResponse(conn.hasBufferedLine());
         }
     }
 
@@ -426,7 +433,7 @@ pub const Server = struct {
         return try out.toOwnedSlice(self.allocator);
     }
 
-    fn broadcastSnapshot(self: *Server, snapshot: *PublishSnapshot, topic_name: []const u8, msg: []const u8) !usize {
+    fn broadcastSnapshot(self: *Server, snapshot: *PublishSnapshot, topic_name: []const u8, msg: []const u8) usize {
         _ = self;
         var delivered: usize = 0;
         for (snapshot.items()) |conn| {
@@ -438,35 +445,36 @@ pub const Server = struct {
     }
 
     fn handleCommand(self: *Server, conn: *Connection, cmd: Command) !void {
-        if (isOp(cmd.op, "ping")) {
-            try conn.write("+PONG\r\n");
+        if (cmd.kind == .ping) {
+            try conn.writeBuffered("+PONG\r\n");
             return;
         }
 
-        if (isOp(cmd.op, "info")) {
+        if (cmd.kind == .info) {
             const queue_count = self.state.queue_manager.count();
             const topic_count = self.state.topic_manager.count();
 
-            var buf: [320]u8 = undefined;
-            const response = try fmt.bufPrint(&buf, "+{s}\r\nqueues:{d}\r\ntopics:{d}\r\ninitial_capacity:{d}\r\nmax_capacity:{d}\r\n", .{
+            var out = std.ArrayList(u8).empty;
+            defer out.deinit(self.allocator);
+            try out.writer(self.allocator).print("+{s}\r\nqueues:{d}\r\ntopics:{d}\r\ninitial_capacity:{d}\r\nmax_capacity:{d}\r\n", .{
                 version.banner,
                 queue_count,
                 topic_count,
                 self.config.queue_capacity,
                 self.config.max_queue_capacity,
             });
-            try conn.write(response);
+            try conn.writeBuffered(out.items);
             return;
         }
 
-        if (isOp(cmd.op, "push") or isOp(cmd.op, "send")) {
+        if (cmd.kind == .push or cmd.kind == .send) {
             if (cmd.queue == null or cmd.body == null) {
-                try conn.write("-ERR need queue and body\r\n");
+                try conn.writeBuffered("-ERR need queue and body\r\n");
                 return;
             }
 
-            const msg = Message.init(self.allocator, nextMsgId(), cmd.body.?) catch {
-                try conn.write("-ERR out of memory\r\n");
+            const msg = Message.init(self.allocator, 0, cmd.body.?) catch {
+                try conn.writeBuffered("-ERR out of memory\r\n");
                 return;
             };
 
@@ -477,110 +485,110 @@ pub const Server = struct {
                 self.config.queue_capacity,
                 self.config.max_queue_capacity,
             )) {
-                .ok => try conn.write("+OK\r\n"),
+                .ok => try conn.writeBuffered("+OK\r\n"),
                 .queue_full => {
                     msg.deinit(self.allocator);
-                    try conn.write("-ERR queue full\r\n");
+                    try conn.writeBuffered("-ERR queue full\r\n");
                 },
                 .out_of_memory => {
                     msg.deinit(self.allocator);
-                    try conn.write("-ERR out of memory\r\n");
+                    try conn.writeBuffered("-ERR out of memory\r\n");
                 },
                 .create_failed => {
                     msg.deinit(self.allocator);
-                    try conn.write("-ERR create queue failed\r\n");
+                    try conn.writeBuffered("-ERR create queue failed\r\n");
                 },
             }
             return;
         }
 
-        if (isOp(cmd.op, "pop") or isOp(cmd.op, "recv")) {
+        if (cmd.kind == .pop or cmd.kind == .recv) {
             if (cmd.queue == null) {
-                try conn.write("-ERR need queue name\r\n");
+                try conn.writeBuffered("-ERR need queue name\r\n");
                 return;
             }
 
             switch (self.state.queue_manager.pop(cmd.queue.?)) {
-                .queue_not_found => try conn.write("-ERR queue not found\r\n"),
-                .empty => try conn.write("-ERR empty\r\n"),
+                .queue_not_found => try conn.writeBuffered("-ERR queue not found\r\n"),
+                .empty => try conn.writeBuffered("-ERR empty\r\n"),
                 .message => |msg| {
                     defer msg.deinit(self.allocator);
-                    try conn.writeBulk(msg.body);
+                    try conn.writeBulkBuffered(msg.bytes());
                 },
             }
             return;
         }
 
-        if (isOp(cmd.op, "peek")) {
+        if (cmd.kind == .peek) {
             if (cmd.queue == null) {
-                try conn.write("-ERR need queue name\r\n");
+                try conn.writeBuffered("-ERR need queue name\r\n");
                 return;
             }
 
             switch (self.state.queue_manager.peekCopy(self.allocator, cmd.queue.?)) {
-                .queue_not_found => try conn.write("-ERR queue not found\r\n"),
-                .empty => try conn.write("-ERR empty\r\n"),
-                .out_of_memory => try conn.write("-ERR out of memory\r\n"),
+                .queue_not_found => try conn.writeBuffered("-ERR queue not found\r\n"),
+                .empty => try conn.writeBuffered("-ERR empty\r\n"),
+                .out_of_memory => try conn.writeBuffered("-ERR out of memory\r\n"),
                 .body => |body| {
                     defer self.allocator.free(body);
-                    try conn.writeBulk(body);
+                    try conn.writeBulkBuffered(body);
                 },
             }
             return;
         }
 
-        if (isOp(cmd.op, "len")) {
+        if (cmd.kind == .len) {
             if (cmd.queue == null) {
-                try conn.write("-ERR need queue name\r\n");
+                try conn.writeBuffered("-ERR need queue name\r\n");
                 return;
             }
 
             if (self.state.queue_manager.len(cmd.queue.?)) |len| {
                 var buf: [32]u8 = undefined;
                 const response = try fmt.bufPrint(&buf, "+{d}\r\n", .{len});
-                try conn.write(response);
+                try conn.writeBuffered(response);
             } else {
-                try conn.write("-ERR queue not found\r\n");
+                try conn.writeBuffered("-ERR queue not found\r\n");
             }
             return;
         }
 
-        if (isOp(cmd.op, "queues")) {
+        if (cmd.kind == .queues) {
             const response = try self.buildQueuesResponse();
             defer self.allocator.free(response);
 
-            try conn.write(response);
+            try conn.writeBuffered(response);
             return;
         }
 
-        if (isOp(cmd.op, "qcreate") or isOp(cmd.op, "mq")) {
+        if (cmd.kind == .qcreate or cmd.kind == .mq) {
             if (cmd.queue == null) {
-                try conn.write("-ERR need queue name\r\n");
+                try conn.writeBuffered("-ERR need queue name\r\n");
                 return;
             }
 
             if (self.state.queue_manager.ensureQueue(cmd.queue.?, self.config.queue_capacity, self.config.max_queue_capacity)) {
-                try conn.write("+OK\r\n");
+                try conn.writeBuffered("+OK\r\n");
             } else {
-                try conn.write("-ERR create queue failed\r\n");
+                try conn.writeBuffered("-ERR create queue failed\r\n");
             }
             return;
         }
 
-        if (isOp(cmd.op, "sub")) {
+        if (cmd.kind == .sub) {
             if (cmd.queue == null) {
-                try conn.write("-ERR need topic name\r\n");
+                try conn.writeBuffered("-ERR need topic name\r\n");
                 return;
             }
 
             switch (self.state.topic_manager.subscribe(cmd.queue.?, conn)) {
-                .ok => try conn.write("+OK\r\n"),
-                .failed => try conn.write("-ERR subscribe failed\r\n"),
+                .ok => try conn.writeBuffered("+OK\r\n"),
+                .failed => try conn.writeBuffered("-ERR subscribe failed\r\n"),
             }
             return;
         }
 
-        if (isOp(cmd.op, "unsub")) {
+        if (cmd.kind == .unsub) {
             if (cmd.queue) |topic_name| {
                 self.state.topic_manager.unsubscribe(topic_name, conn);
                 conn.removeSubscription(topic_name);
@@ -591,52 +599,50 @@ pub const Server = struct {
                 conn.clearSubscriptions();
             }
 
-            try conn.write("+OK\r\n");
+            try conn.writeBuffered("+OK\r\n");
             return;
         }
 
-        if (isOp(cmd.op, "pub")) {
+        if (cmd.kind == .@"pub") {
             if (cmd.queue == null or cmd.body == null) {
-                try conn.write("-ERR need topic and message\r\n");
+                try conn.writeBuffered("-ERR need topic and message\r\n");
                 return;
             }
 
             switch (self.state.topic_manager.snapshotForPublish(self.allocator, cmd.queue.?)) {
-                .out_of_memory => try conn.write("-ERR publish failed\r\n"),
-                .no_subscribers => try conn.write("+OK 0\r\n"),
+                .out_of_memory => try conn.writeBuffered("-ERR publish failed\r\n"),
+                .no_subscribers => try conn.writeBuffered("+OK 0\r\n"),
                 .snapshot => |snapshot| {
                     var owned_snapshot = snapshot;
                     defer owned_snapshot.deinit();
 
-                    const count = self.broadcastSnapshot(&owned_snapshot, cmd.queue.?, cmd.body.?) catch {
-                        try conn.write("-ERR publish failed\r\n");
-                        return;
-                    };
+                    try conn.flushBuffered();
+                    const count = self.broadcastSnapshot(&owned_snapshot, cmd.queue.?, cmd.body.?);
                     var buf: [32]u8 = undefined;
                     const response = try fmt.bufPrint(&buf, "+OK {d}\r\n", .{count});
-                    try conn.write(response);
+                    try conn.writeBuffered(response);
                 },
             }
             return;
         }
 
-        if (isOp(cmd.op, "topics")) {
+        if (cmd.kind == .topics) {
             const response = try self.buildTopicsResponse();
             defer self.allocator.free(response);
 
-            try conn.write(response);
+            try conn.writeBuffered(response);
             return;
         }
 
-        if (isOp(cmd.op, "subs")) {
+        if (cmd.kind == .subs) {
             const response = try self.buildSubscriptionsResponse(conn);
             defer self.allocator.free(response);
 
-            try conn.write(response);
+            try conn.writeBuffered(response);
             return;
         }
 
-        try conn.write("-ERR unknown command\r\n");
+        try conn.writeBuffered("-ERR unknown command\r\n");
     }
 
     pub fn run(self: *Server) !void {
@@ -683,6 +689,6 @@ test "broadcast count reflects successful deliveries" {
     };
     defer snapshot.deinit();
 
-    const count = try server.broadcastSnapshot(&snapshot, "news", "hello");
+    const count = server.broadcastSnapshot(&snapshot, "news", "hello");
     try testing.expectEqual(@as(usize, 0), count);
 }

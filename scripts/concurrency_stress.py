@@ -52,6 +52,203 @@ def format_rate(value: float) -> str:
     return f"{value:,.0f}/s"
 
 
+def send_repeated(sock: socket.socket, command: bytes, count: int) -> None:
+    max_batch_bytes = 1 << 20
+    per_batch = max(1, max_batch_bytes // max(1, len(command)))
+    remaining = count
+    while remaining > 0:
+        batch_count = min(remaining, per_batch)
+        sock.sendall(command * batch_count)
+        remaining -= batch_count
+
+
+def recv_simple_lines(sock: socket.socket, count: int) -> None:
+    seen = 0
+    pending = b""
+    saw_error = False
+
+    while seen < count:
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise TestFailure("server closed the connection unexpectedly")
+        if b"-ERR" in chunk:
+            saw_error = True
+
+        pending += chunk
+        line_count = pending.count(b"\r\n")
+        if line_count == 0:
+            continue
+
+        seen += line_count
+        last_line_end = pending.rfind(b"\r\n")
+        pending = pending[last_line_end + 2 :]
+
+    if saw_error:
+        raise TestFailure("pipelined command stream returned an error response")
+
+
+def recv_bulk_responses(sock: socket.socket, count: int) -> None:
+    seen = 0
+    pending = bytearray()
+
+    while seen < count:
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise TestFailure("server closed the connection unexpectedly")
+        pending.extend(chunk)
+
+        while pending:
+            if pending[0] != ord("$"):
+                raise TestFailure(f"expected bulk response, got {bytes(pending[:64])!r}")
+
+            header_end = pending.find(b"\r\n")
+            if header_end == -1:
+                break
+
+            try:
+                body_len = int(pending[1:header_end])
+            except ValueError as exc:
+                raise TestFailure(f"invalid bulk response header: {bytes(pending[:64])!r}") from exc
+
+            response_len = header_end + 2 + body_len + 2
+            if len(pending) < response_len:
+                break
+            if pending[response_len - 2 : response_len] != b"\r\n":
+                raise TestFailure(f"malformed bulk response: {bytes(pending[:64])!r}")
+
+            del pending[:response_len]
+            seen += 1
+            if seen >= count:
+                break
+
+
+def run_pipelined_lines(
+    sock: socket.socket,
+    command: bytes,
+    count: int,
+    window: int,
+) -> None:
+    remaining = count
+    while remaining > 0:
+        batch_count = min(remaining, window)
+        send_repeated(sock, command, batch_count)
+        recv_simple_lines(sock, batch_count)
+        remaining -= batch_count
+
+
+def run_pipelined_bulk(
+    sock: socket.socket,
+    command: bytes,
+    count: int,
+    window: int,
+) -> None:
+    remaining = count
+    while remaining > 0:
+        batch_count = min(remaining, window)
+        send_repeated(sock, command, batch_count)
+        recv_bulk_responses(sock, batch_count)
+        remaining -= batch_count
+
+
+def scenario_pipelined_send(exe_path: str, args: argparse.Namespace) -> dict[str, str]:
+    queue_name = "pipeline-send"
+    total_messages = args.pipeline_messages
+    payload = "x" * args.pipeline_payload_bytes
+    command = f"send {queue_name} {payload}\r\n".encode("utf-8")
+
+    with running_server(
+        exe_path,
+        [
+            "--capacity",
+            str(args.capacity),
+            "--max-capacity",
+            str(max(args.max_capacity, total_messages)),
+        ],
+    ) as server:
+        sock = socket.create_connection((server.host, server.port), timeout=args.deadline_seconds)
+        sock.settimeout(args.deadline_seconds)
+        try:
+            start = time.perf_counter()
+            run_pipelined_lines(sock, command, total_messages, args.pipeline_window)
+            duration = time.perf_counter() - start
+        finally:
+            sock.close()
+
+        admin = Client(server.host, server.port, timeout=args.deadline_seconds)
+        try:
+            expect_equal(
+                admin.request(f"len {queue_name}", timeout=args.deadline_seconds),
+                f"+{total_messages}\r\n".encode("utf-8"),
+                "pipelined send final len",
+            )
+        finally:
+            admin.close()
+
+    return {
+        "messages": str(total_messages),
+        "payload_bytes": str(args.pipeline_payload_bytes),
+        "throughput": format_rate(total_messages / duration),
+        "avg_us_per_op": f"{(duration * 1_000_000) / total_messages:.1f}",
+    }
+
+
+def scenario_pipelined_recv(exe_path: str, args: argparse.Namespace) -> dict[str, str]:
+    queue_name = "pipeline-recv"
+    total_messages = args.pipeline_messages
+    payload = "x" * args.pipeline_payload_bytes
+    send_command = f"send {queue_name} {payload}\r\n".encode("utf-8")
+    recv_command = f"recv {queue_name}\r\n".encode("utf-8")
+
+    with running_server(
+        exe_path,
+        [
+            "--capacity",
+            str(args.capacity),
+            "--max-capacity",
+            str(max(args.max_capacity, total_messages)),
+        ],
+    ) as server:
+        sock = socket.create_connection((server.host, server.port), timeout=args.deadline_seconds)
+        sock.settimeout(args.deadline_seconds)
+        try:
+            run_pipelined_lines(sock, send_command, total_messages, args.pipeline_window)
+
+            start = time.perf_counter()
+            run_pipelined_bulk(sock, recv_command, total_messages, args.pipeline_window)
+            duration = time.perf_counter() - start
+        finally:
+            sock.close()
+
+        admin = Client(server.host, server.port, timeout=args.deadline_seconds)
+        try:
+            expect_equal(
+                admin.request(f"len {queue_name}", timeout=args.deadline_seconds),
+                b"+0\r\n",
+                "pipelined recv final len",
+            )
+        finally:
+            admin.close()
+
+    return {
+        "messages": str(total_messages),
+        "payload_bytes": str(args.pipeline_payload_bytes),
+        "throughput": format_rate(total_messages / duration),
+        "avg_us_per_op": f"{(duration * 1_000_000) / total_messages:.1f}",
+    }
+
+
+def warmup(exe_path: str) -> None:
+    with running_server(exe_path, ["--capacity", "1024", "--max-capacity", "4096"]) as server:
+        client = Client(server.host, server.port, timeout=2.0)
+        try:
+            for i in range(200):
+                payload = f"warm-{i}"
+                expect_equal(client.request(f"send warmup {payload}"), b"+OK\r\n", "warmup send")
+                _ = parse_bulk_response(client.request("recv warmup"))
+        finally:
+            client.close()
+
+
 def scenario_queue_contention(exe_path: str, args: argparse.Namespace) -> dict[str, str]:
     queue_name = "stress-q"
     total_messages = args.queue_producers * args.queue_messages
@@ -454,11 +651,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-capacity", type=int, default=4096, help="Max queue capacity.")
     parser.add_argument("--queue-producers", type=int, default=4, help="Number of producer clients.")
     parser.add_argument("--queue-consumers", type=int, default=4, help="Number of consumer clients.")
-    parser.add_argument("--queue-messages", type=int, default=150, help="Messages per producer.")
+    parser.add_argument("--queue-messages", type=int, default=1000, help="Messages per producer.")
     parser.add_argument("--pubsub-subscribers", type=int, default=6, help="Number of subscriber clients.")
-    parser.add_argument("--pub-messages", type=int, default=60, help="Published messages per run.")
+    parser.add_argument("--pub-messages", type=int, default=500, help="Published messages per run.")
     parser.add_argument("--roundtrip-workers", type=int, default=8, help="Workers on distinct queues for parallel roundtrip benchmarking.")
-    parser.add_argument("--roundtrip-messages", type=int, default=120, help="Messages per worker in the independent-queue roundtrip scenario.")
+    parser.add_argument("--roundtrip-messages", type=int, default=1000, help="Messages per worker in the independent-queue roundtrip scenario.")
+    parser.add_argument("--pipeline-messages", type=int, default=200000, help="Messages per pipelined benchmark scenario.")
+    parser.add_argument("--pipeline-payload-bytes", type=int, default=16, help="Payload size for pipelined benchmark scenarios.")
+    parser.add_argument("--pipeline-window", type=int, default=4096, help="Commands in flight per pipelined benchmark window.")
     parser.add_argument("--deadline-seconds", type=float, default=10.0, help="Per-scenario timeout budget.")
     parser.add_argument(
         "--quick",
@@ -479,18 +679,24 @@ def apply_quick_profile(args: argparse.Namespace) -> None:
     args.pub_messages = min(args.pub_messages, 20)
     args.roundtrip_workers = min(args.roundtrip_workers, 4)
     args.roundtrip_messages = min(args.roundtrip_messages, 40)
+    args.pipeline_messages = min(args.pipeline_messages, 1000)
+    args.pipeline_window = min(args.pipeline_window, args.pipeline_messages)
     args.deadline_seconds = min(args.deadline_seconds, 6.0)
 
 
 def main() -> int:
     args = parse_args()
     apply_quick_profile(args)
+    args.pipeline_window = max(1, min(args.pipeline_window, args.pipeline_messages))
     exe_path = resolve_exe(args.exe)
+    warmup(exe_path)
 
     scenarios = [
         ("queue_contention", scenario_queue_contention),
         ("independent_queue_roundtrips", scenario_independent_queue_roundtrips),
         ("pubsub_fanout", scenario_pubsub_fanout),
+        ("pipelined_send", scenario_pipelined_send),
+        ("pipelined_recv", scenario_pipelined_recv),
     ]
     results = [run_scenario(name, func, exe_path, args) for name, func in scenarios]
     return print_summary(results)

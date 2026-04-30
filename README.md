@@ -8,7 +8,7 @@ ZigMQ is a lightweight in-memory message queue and pub/sub server written in Zig
 
 - One server, two messaging patterns: point-to-point queues and pub/sub topics.
 - Single binary, no external service dependency, easy to drop into scripts, prototypes, and internal tools.
-- Sharded queue/topic locking with snapshot-based fanout, so hot paths stay simple and safe.
+- Sharded queue/topic management with lock-free queue operations and snapshot-based fanout, so hot paths stay simple and fast.
 - Clear queue-full semantics, explicit error responses, and automatic queue growth up to a configured ceiling.
 - Built-in unit, protocol, stress, and benchmark harnesses for safe iteration.
 
@@ -29,8 +29,8 @@ ZigMQ is a lightweight in-memory message queue and pub/sub server written in Zig
 
 Release assets are published as:
 
-- `zigmq-v0.4.1-linux-x86_64.tar.gz`
-- `zigmq-v0.4.1-macos-aarch64.tar.gz`
+- `zigmq-v0.5.0-linux-x86_64.tar.gz`
+- `zigmq-v0.5.0-macos-aarch64.tar.gz`
 - `SHA256SUMS.txt`
 
 Extract the archive and run `./zigmq`.
@@ -168,22 +168,38 @@ What they cover:
 
 ## Performance Baseline
 
-Representative local baseline on April 4, 2026:
+Representative local baseline on April 30, 2026 (v0.5.0):
 
 - Machine: Apple Silicon macOS
 - Zig: `0.15.2`
-- Build: `ReleaseFast`
+- Build: `Debug` (development baseline)
 - Transport: loopback TCP
 - Command: `zig build benchmark`
 
 | Scenario | Result |
 | --- | --- |
-| `queue_contention` | `45,659 ops/s`, `21.9 us/op` |
-| `independent_queue_roundtrips` | `46,002 ops/s`, `21.7 us/op` |
-| `pubsub_fanout publish_rate` | `12,765 msg/s` |
-| `pubsub_fanout delivery_rate` | `76,589 deliveries/s` |
+| `queue_contention` | `64,000 ops/s`, `15.6 us/op` |
+| `independent_queue_roundtrips` | `42,700 ops/s`, `23.4 us/op` |
+| `pubsub_fanout publish_rate` | `9,100 msg/s` |
+| `pubsub_fanout delivery_rate` | `91,500 deliveries/s` |
+| `pipelined_send` | `1,580,000 msg/s`, `0.6 us/op` |
+| `pipelined_recv` | `1,350,000 msg/s`, `0.7 us/op` |
 
 These numbers are intended as a practical local baseline, not a formal lab benchmark. They are most useful for comparing changes across commits on the same machine.
+
+Pipelined send/receive throughput demonstrates the server-side processing capability (~1.5M msg/s). Synchronous scenarios are bounded by Python client round-trip latency over loopback TCP.
+
+## Changelog
+
+### v0.5.0 (2026-04-30)
+
+- **Lock-free queue operations**: Replaced mutex-based queue push/pop with CAS-based lock-free MPMC ring buffer algorithm. Queue hot paths no longer serialize on mutex, laying the foundation for thread-pool based connection handling.
+- **Allocator fix**: Replaced `smp_allocator` (fixed-size bump allocator) with `GeneralPurposeAllocator` to prevent OOM in long-running servers.
+- **Write buffering**: Added per-connection write buffer with response batching to reduce TCP syscalls and support protocol pipelining.
+- **Operation dispatch**: Replaced string-based command matching (`isOp`) with a pre-parsed `Operation` enum for faster command dispatch.
+- **Inline message storage**: Messages ≤32 bytes are stored inline (no heap allocation) in the ring buffer.
+- **Protocol hardening**: Fixed INFO response buffer overflow, corrected `broadcastSnapshot` return type.
+- **Minimum ring buffer capacity**: Enforced minimum capacity of 2 for algorithmic correctness of the lock-free sequence protocol.
 
 ## Release Workflow
 
