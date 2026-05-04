@@ -29,8 +29,8 @@ ZigMQ 是一个使用 Zig 编写的轻量级内存消息队列与发布订阅服
 
 当前 release 资产包含：
 
-- `zigmq-v0.5.0-linux-x86_64.tar.gz`
-- `zigmq-v0.5.0-macos-aarch64.tar.gz`
+- `zigmq-v0.6.0-linux-x86_64.tar.gz`
+- `zigmq-v0.6.0-macos-aarch64.tar.gz`
 - `SHA256SUMS.txt`
 
 下载解压后直接运行 `./zigmq` 即可。
@@ -39,7 +39,7 @@ ZigMQ 是一个使用 Zig 编写的轻量级内存消息队列与发布订阅服
 
 环境要求：
 
-- Zig `0.15.2`
+- Zig `0.16.0`
 
 ```bash
 git clone https://github.com/reasonz/zigMQ.git
@@ -168,24 +168,24 @@ zig build benchmark
 
 ## 性能指标
 
-以下数据来自 2026 年 4 月 30 日本地基线测试（v0.5.0）：
+以下数据来自 2026 年 5 月 3 日本地基线测试（v0.6.0）：
 
 - 机器：Apple Silicon macOS
-- Zig：`0.15.2`
+- Zig：`0.16.0`
 - 构建模式：`Debug`（开发基线）
 - 网络：本机 loopback TCP
 - 命令：`zig build benchmark`
 
 | 场景 | 结果 |
 | --- | --- |
-| `queue_contention` | `64,000 ops/s`，`15.6 us/op` |
-| `independent_queue_roundtrips` | `42,700 ops/s`，`23.4 us/op` |
-| `pubsub_fanout publish_rate` | `9,100 msg/s` |
-| `pubsub_fanout delivery_rate` | `91,500 deliveries/s` |
-| `pipelined_send` | `1,580,000 msg/s`，`0.6 us/op` |
-| `pipelined_recv` | `1,350,000 msg/s`，`0.7 us/op` |
+| `queue_contention` | `43,000 ops/s`，`23.2 us/op` |
+| `independent_queue_roundtrips` | `43,300 ops/s`，`23.1 us/op` |
+| `pubsub_fanout publish_rate` | `16,200 msg/s` |
+| `pubsub_fanout delivery_rate` | `97,300 deliveries/s` |
+| `pipelined_send` | `1,210,000 msg/s`，`0.8 us/op` |
+| `pipelined_recv` | `1,200,000 msg/s`，`0.8 us/op` |
 
-这些数据更适合作为”同一台机器、同一套脚本下的版本对比基线”，而不是严格的实验室 benchmark。流水线吞吐量展示了服务端处理能力（~1.5M msg/s），同步场景受限于 Python 客户端 TCP 往返延迟。
+这些数据更适合作为”同一台机器、同一套脚本下的版本对比基线”，而不是严格的实验室 benchmark。流水线吞吐量展示了服务端处理能力（~1.2M msg/s），同步场景受限于 Python 客户端 TCP 往返延迟。
 
 ## 变更日志
 
@@ -198,6 +198,12 @@ zig build benchmark
 - **消息内联存储**：≤32 字节的消息直接内联存储在环形缓冲区中，无需堆分配
 - **协议修复**：修复 INFO 响应缓冲区溢出、`broadcastSnapshot` 返回值类型等问题
 - **最小容量约束**：环形缓冲区最小容量设为 2，确保无锁序列算法的正确性
+
+### v0.6.0 (2026-05-03)
+
+- **Zig 0.16.0 迁移**：升级编译器和标准库，采用 Juicy Main（`std.process.Init`）、`std.Io` 接口、`Io.Mutex`、非托管 `ArrayList` 及 `@embedFile` 构建时数据嵌入。
+- **堆内存损坏修复**：修复 `Connection.init` 栈指针逃逸问题，reader/writer 内部指针在结构体堆分配后正确指向堆内存。
+- **管道命令死循环修复**：修复读缓冲区满且含不完整数据时 `readLine` 的死循环，rebase 现在能正确释放空间后重试。
 
 ## 打包与发布
 

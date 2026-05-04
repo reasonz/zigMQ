@@ -29,8 +29,8 @@ ZigMQ is a lightweight in-memory message queue and pub/sub server written in Zig
 
 Release assets are published as:
 
-- `zigmq-v0.5.0-linux-x86_64.tar.gz`
-- `zigmq-v0.5.0-macos-aarch64.tar.gz`
+- `zigmq-v0.6.0-linux-x86_64.tar.gz`
+- `zigmq-v0.6.0-macos-aarch64.tar.gz`
 - `SHA256SUMS.txt`
 
 Extract the archive and run `./zigmq`.
@@ -39,7 +39,7 @@ Extract the archive and run `./zigmq`.
 
 Requirements:
 
-- Zig `0.15.2`
+- Zig `0.16.0`
 
 ```bash
 git clone https://github.com/reasonz/zigMQ.git
@@ -168,26 +168,26 @@ What they cover:
 
 ## Performance Baseline
 
-Representative local baseline on April 30, 2026 (v0.5.0):
+Representative local baseline on May 3, 2026 (v0.6.0):
 
 - Machine: Apple Silicon macOS
-- Zig: `0.15.2`
+- Zig: `0.16.0`
 - Build: `Debug` (development baseline)
 - Transport: loopback TCP
 - Command: `zig build benchmark`
 
 | Scenario | Result |
 | --- | --- |
-| `queue_contention` | `64,000 ops/s`, `15.6 us/op` |
-| `independent_queue_roundtrips` | `42,700 ops/s`, `23.4 us/op` |
-| `pubsub_fanout publish_rate` | `9,100 msg/s` |
-| `pubsub_fanout delivery_rate` | `91,500 deliveries/s` |
-| `pipelined_send` | `1,580,000 msg/s`, `0.6 us/op` |
-| `pipelined_recv` | `1,350,000 msg/s`, `0.7 us/op` |
+| `queue_contention` | `43,000 ops/s`, `23.2 us/op` |
+| `independent_queue_roundtrips` | `43,300 ops/s`, `23.1 us/op` |
+| `pubsub_fanout publish_rate` | `16,200 msg/s` |
+| `pubsub_fanout delivery_rate` | `97,300 deliveries/s` |
+| `pipelined_send` | `1,210,000 msg/s`, `0.8 us/op` |
+| `pipelined_recv` | `1,200,000 msg/s`, `0.8 us/op` |
 
 These numbers are intended as a practical local baseline, not a formal lab benchmark. They are most useful for comparing changes across commits on the same machine.
 
-Pipelined send/receive throughput demonstrates the server-side processing capability (~1.5M msg/s). Synchronous scenarios are bounded by Python client round-trip latency over loopback TCP.
+Pipelined send/receive throughput demonstrates the server-side processing capability (~1.2M msg/s). Synchronous scenarios are bounded by Python client round-trip latency over loopback TCP.
 
 ## Changelog
 
@@ -200,6 +200,12 @@ Pipelined send/receive throughput demonstrates the server-side processing capabi
 - **Inline message storage**: Messages ≤32 bytes are stored inline (no heap allocation) in the ring buffer.
 - **Protocol hardening**: Fixed INFO response buffer overflow, corrected `broadcastSnapshot` return type.
 - **Minimum ring buffer capacity**: Enforced minimum capacity of 2 for algorithmic correctness of the lock-free sequence protocol.
+
+### v0.6.0 (2026-05-03)
+
+- **Zig 0.16.0 migration**: Upgraded compiler and standard library. Adopted Juicy Main (`std.process.Init`), `std.Io` interface for all I/O, `Io.Mutex`, unmanaged `ArrayList`, and `@embedFile` for build-time data.
+- **Heap corruption fix**: Fixed stack pointer escape in `Connection.init` — internal reader/writer pointers now correctly reference heap memory after the connection struct is heap-allocated.
+- **Pipeline hang fix**: Fixed infinite loop in `readLine` when the read buffer is full of partial data; rebase now correctly frees space before retrying.
 
 ## Release Workflow
 
