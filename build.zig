@@ -60,7 +60,7 @@ pub fn build(b: *std.Build) void {
 }
 
 fn readVersion(b: *std.Build) []const u8 {
-    const cwd = std.fs.cwd();
-    const version = cwd.readFileAlloc(b.allocator, "VERSION", 64) catch @panic("failed to read VERSION");
-    return std.mem.trimRight(u8, version, "\r\n");
+    _ = b;
+    const version: []const u8 = @embedFile("VERSION");
+    return std.mem.trimEnd(u8, version, "\r\n");
 }

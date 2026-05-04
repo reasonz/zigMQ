@@ -11,42 +11,49 @@ pub const Config = struct {
     data_dir: ?[]const u8 = null,
 };
 
-pub fn parseArgs() Config {
-    var args = std.process.args();
-    _ = args.next();
-
+pub fn parseArgs(args: []const [:0]const u8) Config {
     var config = Config{};
 
-    while (args.next()) |arg| {
+    var i: usize = 1; // skip program name
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
         if (mem.eql(u8, arg, "--port")) {
-            if (args.next()) |value| {
-                config.port = fmt.parseInt(u16, value, 10) catch 8388;
+            i += 1;
+            if (i < args.len) {
+                config.port = fmt.parseInt(u16, args[i], 10) catch 8388;
             }
         } else if (mem.eql(u8, arg, "--workers")) {
-            if (args.next()) |value| {
-                config.workers = fmt.parseInt(u32, value, 10) catch 1;
+            i += 1;
+            if (i < args.len) {
+                config.workers = fmt.parseInt(u32, args[i], 10) catch 1;
             }
         } else if (mem.eql(u8, arg, "--capacity")) {
-            if (args.next()) |value| {
-                config.queue_capacity = fmt.parseInt(usize, value, 10) catch 10000;
+            i += 1;
+            if (i < args.len) {
+                config.queue_capacity = fmt.parseInt(usize, args[i], 10) catch 10000;
                 if (config.queue_capacity < 2) config.queue_capacity = 10000;
             }
         } else if (mem.eql(u8, arg, "--max-capacity")) {
-            if (args.next()) |value| {
-                config.max_queue_capacity = fmt.parseInt(usize, value, 10) catch 100000;
+            i += 1;
+            if (i < args.len) {
+                config.max_queue_capacity = fmt.parseInt(usize, args[i], 10) catch 100000;
             }
         } else if (mem.eql(u8, arg, "--mode")) {
-            if (args.next()) |value| {
-                if (mem.eql(u8, value, "master")) {
+            i += 1;
+            if (i < args.len) {
+                if (mem.eql(u8, args[i], "master")) {
                     config.mode = .master;
-                } else if (mem.eql(u8, value, "worker")) {
+                } else if (mem.eql(u8, args[i], "worker")) {
                     config.mode = .worker;
                 } else {
                     config.mode = .standalone;
                 }
             }
         } else if (mem.eql(u8, arg, "--data-dir")) {
-            config.data_dir = args.next();
+            i += 1;
+            if (i < args.len) {
+                config.data_dir = args[i];
+            }
         }
     }
 

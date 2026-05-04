@@ -2,33 +2,36 @@ const std = @import("std");
 const atomic = std.atomic;
 const fmt = std.fmt;
 const mem = std.mem;
-const net = std.net;
-const posix = std.posix;
 const testing = std.testing;
 
 pub const Connection = struct {
     const read_buffer_capacity = 16 * 1024;
     const write_buffer_capacity = 64 * 1024;
 
-    stream: net.Stream,
-    buffer: [read_buffer_capacity]u8 = undefined,
-    buffer_start: usize = 0,
-    buffer_end: usize = 0,
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    read_buffer: [read_buffer_capacity]u8 = undefined,
+    reader: std.Io.net.Stream.Reader,
     write_buffer: [write_buffer_capacity]u8 = undefined,
-    write_buffer_len: usize = 0,
+    writer: std.Io.net.Stream.Writer,
     batch_writes: bool = false,
     allocator: mem.Allocator,
     subscriptions: std.ArrayList([]const u8),
-    write_mutex: std.Thread.Mutex = .{},
+    write_mutex: std.Io.Mutex = .init,
     closed: bool = false,
-    ref_count: atomic.Value(usize) = atomic.Value(usize).init(1),
+    ref_count: atomic.Value(usize) = .init(1),
 
-    pub fn init(stream: net.Stream, allocator: mem.Allocator) Connection {
-        return .{
-            .stream = stream,
-            .allocator = allocator,
-            .subscriptions = std.ArrayList([]const u8).empty,
-        };
+    pub fn init(self: *Connection, stream: std.Io.net.Stream, io: std.Io, allocator: mem.Allocator) void {
+        self.io = io;
+        self.stream = stream;
+        self.allocator = allocator;
+        self.subscriptions = std.ArrayList([]const u8).empty;
+        self.write_mutex = .init;
+        self.closed = false;
+        self.ref_count = .init(1);
+        self.batch_writes = false;
+        self.reader = stream.reader(io, &self.read_buffer);
+        self.writer = stream.writer(io, &self.write_buffer);
     }
 
     pub fn deinit(self: *Connection) void {
@@ -40,7 +43,6 @@ pub const Connection = struct {
         for (self.subscriptions.items) |existing| {
             if (mem.eql(u8, existing, topic)) return;
         }
-
         const copy = try self.allocator.dupe(u8, topic);
         try self.subscriptions.append(self.allocator, copy);
     }
@@ -63,192 +65,132 @@ pub const Connection = struct {
     }
 
     pub fn nextBufferedLine(self: *Connection) ?[]const u8 {
-        const unread = self.buffer[self.buffer_start..self.buffer_end];
-        if (mem.indexOfScalar(u8, unread, '\n')) |idx| {
-            const line = unread[0..idx];
-            self.buffer_start += idx + 1;
-            if (self.buffer_start == self.buffer_end) {
-                self.buffer_start = 0;
-                self.buffer_end = 0;
-            }
+        const buffered = self.reader.interface.buffer[self.reader.interface.seek..self.reader.interface.end];
+        if (mem.indexOfScalar(u8, buffered, '\n')) |idx| {
+            const line = buffered[0..idx];
+            self.reader.interface.seek += idx + 1;
             return line;
         }
         return null;
     }
 
     pub fn hasBufferedLine(self: *Connection) bool {
-        const unread = self.buffer[self.buffer_start..self.buffer_end];
-        return mem.indexOfScalar(u8, unread, '\n') != null;
+        const buffered = self.reader.interface.buffer[self.reader.interface.seek..self.reader.interface.end];
+        return mem.indexOfScalar(u8, buffered, '\n') != null;
     }
 
     pub fn isResponseBatching(self: *const Connection) bool {
-        return self.batch_writes or self.write_buffer_len > 0;
+        return self.batch_writes or self.writer.interface.end > 0;
     }
 
     pub fn beginResponse(self: *Connection, has_more_input: bool) void {
-        self.write_mutex.lock();
-        defer self.write_mutex.unlock();
-        self.batch_writes = has_more_input or self.write_buffer_len > 0;
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
+        self.batch_writes = has_more_input or self.writer.interface.end > 0;
     }
 
     pub fn endResponse(self: *Connection, has_more_input: bool) !void {
-        self.write_mutex.lock();
-        defer self.write_mutex.unlock();
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
         if (has_more_input) return;
-
         self.batch_writes = false;
-        try self.flushBufferedLocked();
-    }
-
-    pub fn compactUnread(self: *Connection) void {
-        if (self.buffer_start == 0) return;
-
-        const unread_len = self.buffer_end - self.buffer_start;
-        if (unread_len > 0) {
-            mem.copyForwards(u8, self.buffer[0..unread_len], self.buffer[self.buffer_start..self.buffer_end]);
-        }
-        self.buffer_start = 0;
-        self.buffer_end = unread_len;
+        try self.writer.interface.flush();
     }
 
     pub fn readLine(self: *Connection) !?[]const u8 {
         while (true) {
             if (self.nextBufferedLine()) |line| return line;
 
-            if (self.buffer_end == self.buffer.len) {
-                if (self.buffer_start == 0) return error.BufferFull;
-                self.compactUnread();
-                continue;
+            if (self.reader.interface.end == self.reader.interface.buffer.len) {
+                if (self.reader.interface.seek == 0) return error.BufferFull;
+                self.reader.interface.rebase(self.reader.interface.buffer.len - self.reader.interface.seek + 1) catch return error.BufferFull;
             }
 
-            const n = try self.stream.read(self.buffer[self.buffer_end..]);
-            if (n == 0) {
-                if (self.buffer_end == self.buffer_start) return null;
-                return error.ConnectionClosed;
-            }
-            self.buffer_end += n;
+            self.reader.interface.fillMore() catch |err| switch (err) {
+                error.EndOfStream => {
+                    if (self.reader.interface.end == self.reader.interface.seek) return null;
+                    if (self.nextBufferedLine()) |line| return line;
+                    return error.ConnectionClosed;
+                },
+                else => return error.ConnectionClosed,
+            };
         }
-    }
-
-    fn flushBufferedLocked(self: *Connection) !void {
-        if (self.write_buffer_len == 0) return;
-        if (self.closed) return error.ConnectionClosed;
-        try self.stream.writeAll(self.write_buffer[0..self.write_buffer_len]);
-        self.write_buffer_len = 0;
-    }
-
-    fn appendBufferedLocked(self: *Connection, data: []const u8) !void {
-        if (self.closed) return error.ConnectionClosed;
-
-        if (data.len > self.write_buffer.len) {
-            try self.flushBufferedLocked();
-            try self.stream.writeAll(data);
-            return;
-        }
-
-        if (self.write_buffer_len + data.len > self.write_buffer.len) {
-            try self.flushBufferedLocked();
-        }
-
-        mem.copyForwards(
-            u8,
-            self.write_buffer[self.write_buffer_len .. self.write_buffer_len + data.len],
-            data,
-        );
-        self.write_buffer_len += data.len;
     }
 
     pub fn flushBuffered(self: *Connection) !void {
-        self.write_mutex.lock();
-        defer self.write_mutex.unlock();
-        try self.flushBufferedLocked();
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
+        try self.writer.interface.flush();
     }
 
     pub fn writeBuffered(self: *Connection, data: []const u8) !void {
-        self.write_mutex.lock();
-        defer self.write_mutex.unlock();
-        if (self.batch_writes) {
-            try self.appendBufferedLocked(data);
-            return;
-        }
-
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
         if (self.closed) return error.ConnectionClosed;
-        try self.flushBufferedLocked();
-        try self.stream.writeAll(data);
+        if (!self.batch_writes) {
+            try self.writer.interface.flush();
+        }
+        try self.writer.interface.writeAll(data);
     }
 
     pub fn write(self: *Connection, data: []const u8) !void {
-        self.write_mutex.lock();
-        defer self.write_mutex.unlock();
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
         if (self.closed) return error.ConnectionClosed;
-        try self.flushBufferedLocked();
-        try self.stream.writeAll(data);
+        try self.writer.interface.flush();
+        try self.writer.interface.writeAll(data);
+        try self.writer.interface.flush();
     }
 
     pub fn writeTopicMessage(self: *Connection, topic: []const u8, msg: []const u8) !void {
-        self.write_mutex.lock();
-        defer self.write_mutex.unlock();
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
         if (self.closed) return error.ConnectionClosed;
-        try self.flushBufferedLocked();
-
-        var iovecs = [_]posix.iovec_const{
-            .{ .base = "+".ptr, .len = 1 },
-            .{ .base = topic.ptr, .len = topic.len },
-            .{ .base = ":".ptr, .len = 1 },
-            .{ .base = msg.ptr, .len = msg.len },
-            .{ .base = "\r\n".ptr, .len = 2 },
-        };
-        try self.stream.writevAll(&iovecs);
+        try self.writer.interface.flush();
+        var parts = [_][]const u8{ "+", topic, ":", msg, "\r\n" };
+        try self.writer.interface.writeVecAll(&parts);
+        try self.writer.interface.flush();
     }
 
     pub fn writeBulkBuffered(self: *Connection, body: []const u8) !void {
-        self.write_mutex.lock();
-        defer self.write_mutex.unlock();
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
         if (self.closed) return error.ConnectionClosed;
 
         if (!self.batch_writes) {
-            try self.flushBufferedLocked();
+            try self.writer.interface.flush();
             var header_buf: [32]u8 = undefined;
             const header = try fmt.bufPrint(&header_buf, "${d}\r\n", .{body.len});
-            var iovecs = [_]posix.iovec_const{
-                .{ .base = header.ptr, .len = header.len },
-                .{ .base = body.ptr, .len = body.len },
-                .{ .base = "\r\n".ptr, .len = 2 },
-            };
-            try self.stream.writevAll(&iovecs);
+            var parts = [_][]const u8{ header, body, "\r\n" };
+            try self.writer.interface.writeVecAll(&parts);
             return;
         }
 
         var header_buf: [32]u8 = undefined;
         const header = try fmt.bufPrint(&header_buf, "${d}\r\n", .{body.len});
-        try self.appendBufferedLocked(header);
-        try self.appendBufferedLocked(body);
-        try self.appendBufferedLocked("\r\n");
+        try self.writer.interface.writeAll(header);
+        try self.writer.interface.writeAll(body);
+        try self.writer.interface.writeAll("\r\n");
     }
 
     pub fn writeBulk(self: *Connection, body: []const u8) !void {
-        self.write_mutex.lock();
-        defer self.write_mutex.unlock();
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
         if (self.closed) return error.ConnectionClosed;
-        try self.flushBufferedLocked();
+        try self.writer.interface.flush();
 
         var header_buf: [32]u8 = undefined;
         const header = try fmt.bufPrint(&header_buf, "${d}\r\n", .{body.len});
-        var iovecs = [_]posix.iovec_const{
-            .{ .base = header.ptr, .len = header.len },
-            .{ .base = body.ptr, .len = body.len },
-            .{ .base = "\r\n".ptr, .len = 2 },
-        };
-        try self.stream.writevAll(&iovecs);
+        var parts = [_][]const u8{ header, body, "\r\n" };
+        try self.writer.interface.writeVecAll(&parts);
     }
 
     pub fn close(self: *Connection) void {
-        self.write_mutex.lock();
-        defer self.write_mutex.unlock();
-
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
         if (self.closed) return;
         self.closed = true;
-        self.stream.close();
+        self.stream.close(self.io);
     }
 
     pub fn retain(self: *Connection) void {
@@ -264,12 +206,13 @@ pub const Connection = struct {
 };
 
 test "connection buffered lines preserve pipelined commands" {
-    var conn = Connection.init(undefined, testing.allocator);
+    var conn: Connection = undefined;
+    conn.init(undefined, testing.io, testing.allocator);
     defer conn.deinit();
 
     const input = "PING\r\nINFO\r\n";
-    mem.copyForwards(u8, conn.buffer[0..input.len], input);
-    conn.buffer_end = input.len;
+    @memcpy(conn.reader.interface.buffer[0..input.len], input);
+    conn.reader.interface.end = input.len;
 
     const first = conn.nextBufferedLine().?;
     try testing.expectEqualStrings("PING\r", first);
@@ -280,22 +223,9 @@ test "connection buffered lines preserve pipelined commands" {
     try testing.expect(conn.nextBufferedLine() == null);
 }
 
-test "connection compaction keeps unread data" {
-    var conn = Connection.init(undefined, testing.allocator);
-    defer conn.deinit();
-
-    mem.copyForwards(u8, conn.buffer[5..10], "HELLO");
-    conn.buffer_start = 5;
-    conn.buffer_end = 10;
-    conn.compactUnread();
-
-    try testing.expectEqual(@as(usize, 0), conn.buffer_start);
-    try testing.expectEqual(@as(usize, 5), conn.buffer_end);
-    try testing.expectEqualStrings("HELLO", conn.buffer[0..5]);
-}
-
 test "closed connection rejects writes" {
-    var conn = Connection.init(undefined, testing.allocator);
+    var conn: Connection = undefined;
+    conn.init(undefined, testing.io, testing.allocator);
     defer conn.deinit();
     conn.closed = true;
 

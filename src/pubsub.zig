@@ -147,9 +147,11 @@ test "topic snapshot retains subscribers until released" {
     var topic = try Topic.init(testing.allocator, "news");
     defer topic.deinit();
 
-    var conn_a = Connection.init(undefined, testing.allocator);
+    var conn_a: Connection = undefined;
+    conn_a.init(undefined, testing.io, testing.allocator);
     defer conn_a.deinit();
-    var conn_b = Connection.init(undefined, testing.allocator);
+    var conn_b: Connection = undefined;
+    conn_b.init(undefined, testing.io, testing.allocator);
     defer conn_b.deinit();
 
     try topic.addSubscriber(&conn_a);
@@ -184,7 +186,7 @@ test "topic snapshot stores small subscriber lists inline" {
 
     var conns: [PublishSnapshot.inline_capacity]Connection = undefined;
     for (&conns, 0..) |*conn, i| {
-        conn.* = Connection.init(undefined, testing.allocator);
+        conn.init(undefined, testing.io, testing.allocator);
         defer conn.deinit();
         try topic.addSubscriber(conn);
         try testing.expectEqual(@as(usize, 1), conn.ref_count.load(.seq_cst));

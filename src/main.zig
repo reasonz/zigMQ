@@ -8,14 +8,14 @@ const pubsub = @import("pubsub.zig");
 const server_mod = @import("server.zig");
 const version = @import("version.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    const app_config = config.parseArgs();
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const app_config = config.parseArgs(args);
 
-    var server = try server_mod.Server.init(allocator, app_config);
+    var server = try server_mod.Server.init(allocator, io, app_config);
     defer server.deinit();
 
     try server.run();

@@ -1,7 +1,7 @@
 const std = @import("std");
 const fmt = std.fmt;
 const mem = std.mem;
-const net = std.net;
+const ionet = std.Io.net;
 const testing = std.testing;
 
 const config_mod = @import("config.zig");
@@ -42,7 +42,7 @@ const QueueManager = struct {
         self.queues.deinit();
     }
 
-    fn getOrCreate(self: *QueueManager, name: []const u8, capacity: usize, max_capacity: usize) !*Queue {
+    fn getOrCreate(self: *QueueManager, io: std.Io, name: []const u8, capacity: usize, max_capacity: usize) !*Queue {
         if (self.queues.get(name)) |queue| {
             return queue;
         }
@@ -50,7 +50,7 @@ const QueueManager = struct {
         const queue = try self.allocator.create(Queue);
         errdefer self.allocator.destroy(queue);
 
-        queue.* = try Queue.init(self.allocator, name, capacity, max_capacity);
+        queue.* = try Queue.init(self.allocator, io, name, capacity, max_capacity);
         errdefer queue.deinit();
 
         try self.queues.put(queue.name, queue);
@@ -76,19 +76,20 @@ const QueuePeekResult = union(enum) {
 };
 
 const QueueShard = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
     manager: QueueManager,
 };
 
 const ShardedQueueManager = struct {
     shards: [queue_shard_count]QueueShard,
+    io: std.Io,
 
-    fn init(allocator: mem.Allocator) ShardedQueueManager {
+    fn init(allocator: mem.Allocator, io: std.Io) ShardedQueueManager {
         var shards: [queue_shard_count]QueueShard = undefined;
         for (&shards) |*shard| {
             shard.* = .{ .manager = QueueManager.init(allocator) };
         }
-        return .{ .shards = shards };
+        return .{ .shards = shards, .io = io };
     }
 
     fn deinit(self: *ShardedQueueManager) void {
@@ -110,12 +111,12 @@ const ShardedQueueManager = struct {
         max_capacity: usize,
     ) QueuePushResult {
         const shard = self.shardFor(name);
-        shard.mutex.lock();
-        const queue = shard.manager.getOrCreate(name, capacity, max_capacity) catch {
-            shard.mutex.unlock();
+        shard.mutex.lockUncancelable(self.io);
+        const queue = shard.manager.getOrCreate(self.io, name, capacity, max_capacity) catch {
+            shard.mutex.unlock(self.io);
             return .create_failed;
         };
-        shard.mutex.unlock();
+        shard.mutex.unlock(self.io);
 
         queue.push(allocator, msg) catch |err| switch (err) {
             error.QueueFull => return .queue_full,
@@ -128,12 +129,12 @@ const ShardedQueueManager = struct {
 
     fn pop(self: *ShardedQueueManager, name: []const u8) QueuePopResult {
         const shard = self.shardFor(name);
-        shard.mutex.lock();
+        shard.mutex.lockUncancelable(self.io);
         const queue = shard.manager.queues.get(name) orelse {
-            shard.mutex.unlock();
+            shard.mutex.unlock(self.io);
             return .queue_not_found;
         };
-        shard.mutex.unlock();
+        shard.mutex.unlock(self.io);
 
         if (queue.pop()) |msg| return .{ .message = msg };
         return .empty;
@@ -141,12 +142,12 @@ const ShardedQueueManager = struct {
 
     fn peekCopy(self: *ShardedQueueManager, allocator: mem.Allocator, name: []const u8) QueuePeekResult {
         const shard = self.shardFor(name);
-        shard.mutex.lock();
+        shard.mutex.lockUncancelable(self.io);
         const queue = shard.manager.queues.get(name) orelse {
-            shard.mutex.unlock();
+            shard.mutex.unlock(self.io);
             return .queue_not_found;
         };
-        shard.mutex.unlock();
+        shard.mutex.unlock(self.io);
 
         const body = queue.peekCopy(allocator) catch |err| switch (err) {
             error.Empty => return .empty,
@@ -157,30 +158,30 @@ const ShardedQueueManager = struct {
 
     fn len(self: *ShardedQueueManager, name: []const u8) ?usize {
         const shard = self.shardFor(name);
-        shard.mutex.lock();
+        shard.mutex.lockUncancelable(self.io);
         const queue = shard.manager.queues.get(name) orelse {
-            shard.mutex.unlock();
+            shard.mutex.unlock(self.io);
             return null;
         };
-        shard.mutex.unlock();
+        shard.mutex.unlock(self.io);
 
         return queue.len();
     }
 
     fn ensureQueue(self: *ShardedQueueManager, name: []const u8, capacity: usize, max_capacity: usize) bool {
         const shard = self.shardFor(name);
-        shard.mutex.lock();
-        defer shard.mutex.unlock();
+        shard.mutex.lockUncancelable(self.io);
+        defer shard.mutex.unlock(self.io);
 
-        return shard.manager.getOrCreate(name, capacity, max_capacity) catch null != null;
+        return shard.manager.getOrCreate(self.io, name, capacity, max_capacity) catch null != null;
     }
 
     fn count(self: *ShardedQueueManager) usize {
         var total: usize = 0;
         for (&self.shards) |*shard| {
-            shard.mutex.lock();
+            shard.mutex.lockUncancelable(self.io);
             total += shard.manager.queues.count();
-            shard.mutex.unlock();
+            shard.mutex.unlock(self.io);
         }
         return total;
     }
@@ -189,8 +190,8 @@ const ShardedQueueManager = struct {
         var total: usize = 0;
         for (&self.shards) |*shard| {
             {
-                shard.mutex.lock();
-                defer shard.mutex.unlock();
+                shard.mutex.lockUncancelable(self.io);
+                defer shard.mutex.unlock(self.io);
                 var it = shard.manager.queues.iterator();
                 while (it.next()) |entry| {
                     try out.appendSlice(allocator, entry.key_ptr.*);
@@ -211,19 +212,20 @@ const TopicPublishResult = union(enum) {
 };
 
 const TopicShard = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
     manager: TopicManager,
 };
 
 const ShardedTopicManager = struct {
     shards: [topic_shard_count]TopicShard,
+    io: std.Io,
 
-    fn init(allocator: mem.Allocator) ShardedTopicManager {
+    fn init(allocator: mem.Allocator, io: std.Io) ShardedTopicManager {
         var shards: [topic_shard_count]TopicShard = undefined;
         for (&shards) |*shard| {
             shard.* = .{ .manager = TopicManager.init(allocator) };
         }
-        return .{ .shards = shards };
+        return .{ .shards = shards, .io = io };
     }
 
     fn deinit(self: *ShardedTopicManager) void {
@@ -238,8 +240,8 @@ const ShardedTopicManager = struct {
 
     fn subscribe(self: *ShardedTopicManager, name: []const u8, conn: *Connection) TopicSubscribeResult {
         const shard = self.shardFor(name);
-        shard.mutex.lock();
-        defer shard.mutex.unlock();
+        shard.mutex.lockUncancelable(self.io);
+        defer shard.mutex.unlock(self.io);
 
         const topic = shard.manager.getOrCreate(name) catch return .failed;
         conn.addSubscription(name) catch return .failed;
@@ -252,16 +254,16 @@ const ShardedTopicManager = struct {
 
     fn unsubscribe(self: *ShardedTopicManager, topic_name: []const u8, conn: *Connection) void {
         const shard = self.shardFor(topic_name);
-        shard.mutex.lock();
-        defer shard.mutex.unlock();
+        shard.mutex.lockUncancelable(self.io);
+        defer shard.mutex.unlock(self.io);
 
         shard.manager.unsubscribe(topic_name, conn);
     }
 
     fn snapshotForPublish(self: *ShardedTopicManager, allocator: mem.Allocator, topic_name: []const u8) TopicPublishResult {
         const shard = self.shardFor(topic_name);
-        shard.mutex.lock();
-        defer shard.mutex.unlock();
+        shard.mutex.lockUncancelable(self.io);
+        defer shard.mutex.unlock(self.io);
 
         const snapshot = shard.manager.snapshotSubscribers(allocator, topic_name) catch {
             return .out_of_memory;
@@ -275,9 +277,9 @@ const ShardedTopicManager = struct {
     fn count(self: *ShardedTopicManager) usize {
         var total: usize = 0;
         for (&self.shards) |*shard| {
-            shard.mutex.lock();
+            shard.mutex.lockUncancelable(self.io);
             total += shard.manager.topics.count();
-            shard.mutex.unlock();
+            shard.mutex.unlock(self.io);
         }
         return total;
     }
@@ -286,12 +288,12 @@ const ShardedTopicManager = struct {
         var total: usize = 0;
         for (&self.shards) |*shard| {
             {
-                shard.mutex.lock();
-                defer shard.mutex.unlock();
+                shard.mutex.lockUncancelable(self.io);
+                defer shard.mutex.unlock(self.io);
                 var it = shard.manager.topics.iterator();
                 while (it.next()) |entry| {
                     const topic = entry.value_ptr.*;
-                    try out.writer(allocator).print("{s}({d})\r\n", .{ entry.key_ptr.*, topic.subscribers.items.len });
+                    try out.print(allocator, "{s}({d})\r\n", .{ entry.key_ptr.*, topic.subscribers.items.len });
                     total += 1;
                 }
             }
@@ -304,10 +306,10 @@ const SharedState = struct {
     queue_manager: ShardedQueueManager,
     topic_manager: ShardedTopicManager,
 
-    fn init(allocator: mem.Allocator) SharedState {
+    fn init(allocator: mem.Allocator, io: std.Io) SharedState {
         return .{
-            .queue_manager = ShardedQueueManager.init(allocator),
-            .topic_manager = ShardedTopicManager.init(allocator),
+            .queue_manager = ShardedQueueManager.init(allocator, io),
+            .topic_manager = ShardedTopicManager.init(allocator, io),
         };
     }
 
@@ -319,17 +321,19 @@ const SharedState = struct {
 
 pub const Server = struct {
     allocator: mem.Allocator,
+    io: std.Io,
     state: SharedState,
     config: Config,
-    listener: net.Server,
+    listener: ionet.Server,
 
-    pub fn init(allocator: mem.Allocator, config: Config) !Server {
-        const addr = try net.Address.parseIp("0.0.0.0", config.port);
-        const listener = try addr.listen(.{ .reuse_address = true });
+    pub fn init(allocator: mem.Allocator, io: std.Io, config: Config) !Server {
+        const addr = try ionet.IpAddress.parseIp4("0.0.0.0", config.port);
+        const listener = try addr.listen(io, .{ .reuse_address = true });
 
         return .{
             .allocator = allocator,
-            .state = SharedState.init(allocator),
+            .io = io,
+            .state = SharedState.init(allocator, io),
             .config = config,
             .listener = listener,
         };
@@ -365,11 +369,10 @@ pub const Server = struct {
                     break;
                 },
                 error.ConnectionClosed => break,
-                else => return err,
             };
 
             const raw = line orelse break;
-            const trimmed = mem.trimRight(u8, raw, "\r");
+            const trimmed = mem.trimEnd(u8, raw, "\r");
             if (trimmed.len == 0) {
                 if (conn.isResponseBatching()) try conn.endResponse(conn.hasBufferedLine());
                 continue;
@@ -389,7 +392,7 @@ pub const Server = struct {
     }
 
     fn buildQueuesResponse(self: *Server) ![]u8 {
-        var out = std.ArrayList(u8).empty;
+        var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(self.allocator);
 
         try out.append(self.allocator, '+');
@@ -402,7 +405,7 @@ pub const Server = struct {
     }
 
     fn buildTopicsResponse(self: *Server) ![]u8 {
-        var out = std.ArrayList(u8).empty;
+        var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(self.allocator);
 
         try out.append(self.allocator, '+');
@@ -415,7 +418,7 @@ pub const Server = struct {
     }
 
     fn buildSubscriptionsResponse(self: *Server, conn: *Connection) ![]u8 {
-        var out = std.ArrayList(u8).empty;
+        var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(self.allocator);
 
         try out.append(self.allocator, '+');
@@ -454,9 +457,9 @@ pub const Server = struct {
             const queue_count = self.state.queue_manager.count();
             const topic_count = self.state.topic_manager.count();
 
-            var out = std.ArrayList(u8).empty;
+            var out: std.ArrayList(u8) = .empty;
             defer out.deinit(self.allocator);
-            try out.writer(self.allocator).print("+{s}\r\nqueues:{d}\r\ntopics:{d}\r\ninitial_capacity:{d}\r\nmax_capacity:{d}\r\n", .{
+            try out.print(self.allocator, "+{s}\r\nqueues:{d}\r\ntopics:{d}\r\ninitial_capacity:{d}\r\nmax_capacity:{d}\r\n", .{
                 version.banner,
                 queue_count,
                 topic_count,
@@ -649,14 +652,14 @@ pub const Server = struct {
         std.debug.print("ZigMQ listening on port {d}\n", .{self.config.port});
 
         while (true) {
-            const incoming = try self.listener.accept();
+            const stream = try self.listener.accept(self.io);
             const conn = try self.allocator.create(Connection);
             errdefer self.allocator.destroy(conn);
 
-            conn.* = Connection.init(incoming.stream, self.allocator);
+            conn.init(stream, self.io, self.allocator);
 
             const thread = std.Thread.spawn(.{}, Server.connectionThreadMain, .{ self, conn }) catch |err| {
-                incoming.stream.close();
+                stream.close(self.io);
                 conn.release(self.allocator);
                 return err;
             };
@@ -668,13 +671,15 @@ pub const Server = struct {
 test "broadcast count reflects successful deliveries" {
     var server = Server{
         .allocator = testing.allocator,
-        .state = SharedState.init(testing.allocator),
+        .io = testing.io,
+        .state = SharedState.init(testing.allocator, testing.io),
         .config = Config{},
         .listener = undefined,
     };
     defer server.state.deinit();
 
-    var conn = Connection.init(undefined, testing.allocator);
+    var conn: Connection = undefined;
+    conn.init(undefined, testing.io, testing.allocator);
     defer conn.deinit();
     conn.closed = true;
 

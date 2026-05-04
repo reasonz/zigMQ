@@ -234,10 +234,11 @@ pub const Queue = struct {
     name: []const u8,
     max_capacity: usize,
     allocator: mem.Allocator,
-    grow_mutex: std.Thread.Mutex = .{},
+    io: std.Io,
+    grow_mutex: std.Io.Mutex = .init,
     old_buffers: std.ArrayList(*RingBuffer),
 
-    pub fn init(allocator: mem.Allocator, name: []const u8, initial_capacity: usize, max_capacity: usize) !Queue {
+    pub fn init(allocator: mem.Allocator, io: std.Io, name: []const u8, initial_capacity: usize, max_capacity: usize) !Queue {
         if (max_capacity < initial_capacity) return error.InvalidCapacity;
 
         const rb = try allocator.create(RingBuffer);
@@ -251,6 +252,7 @@ pub const Queue = struct {
             .name = try allocator.dupe(u8, name),
             .max_capacity = max_capacity,
             .allocator = allocator,
+            .io = io,
             .old_buffers = std.ArrayList(*RingBuffer).empty,
         };
     }
@@ -291,8 +293,8 @@ pub const Queue = struct {
     }
 
     fn dropOldestAndPush(self: *Queue, msg: Message) !void {
-        self.grow_mutex.lock();
-        defer self.grow_mutex.unlock();
+        self.grow_mutex.lockUncancelable(self.io);
+        defer self.grow_mutex.unlock(self.io);
 
         const rb = self.buffer.load(.acquire);
         if (rb.pop()) |oldest| {
@@ -302,8 +304,8 @@ pub const Queue = struct {
     }
 
     pub fn grow(self: *Queue) !void {
-        self.grow_mutex.lock();
-        defer self.grow_mutex.unlock();
+        self.grow_mutex.lockUncancelable(self.io);
+        defer self.grow_mutex.unlock(self.io);
 
         const old_rb = self.buffer.load(.acquire);
         if (old_rb.capacity >= self.max_capacity) return error.QueueFull;
@@ -348,8 +350,8 @@ pub const Queue = struct {
     }
 
     pub fn peekCopy(self: *Queue, allocator: mem.Allocator) ![]u8 {
-        self.grow_mutex.lock();
-        defer self.grow_mutex.unlock();
+        self.grow_mutex.lockUncancelable(self.io);
+        defer self.grow_mutex.unlock(self.io);
         const rb = self.buffer.load(.acquire);
         return rb.peekCopy(allocator);
     }
@@ -446,7 +448,7 @@ test "ring buffer grow preserves messages" {
 }
 
 test "queue rejects when full" {
-    var queue = try Queue.init(testing.allocator, "jobs", 2, 2);
+    var queue = try Queue.init(testing.allocator, testing.io, "jobs", 2, 2);
     defer queue.deinit();
 
     const first = try Message.init(testing.allocator, 1, "first");
@@ -460,7 +462,7 @@ test "queue rejects when full" {
 }
 
 test "queue can drop oldest safely" {
-    var queue = try Queue.init(testing.allocator, "jobs", 2, 2);
+    var queue = try Queue.init(testing.allocator, testing.io, "jobs", 2, 2);
     defer queue.deinit();
     queue.overflow = .drop_oldest;
 
@@ -484,7 +486,7 @@ test "queue can drop oldest safely" {
 }
 
 test "queue auto expands until max capacity" {
-    var queue = try Queue.init(testing.allocator, "jobs", 2, 8);
+    var queue = try Queue.init(testing.allocator, testing.io, "jobs", 2, 8);
     defer queue.deinit();
 
     try queue.push(testing.allocator, try Message.init(testing.allocator, 1, "one"));
@@ -496,7 +498,7 @@ test "queue auto expands until max capacity" {
 }
 
 test "queue stops expanding at max capacity" {
-    var queue = try Queue.init(testing.allocator, "jobs", 2, 4);
+    var queue = try Queue.init(testing.allocator, testing.io, "jobs", 2, 4);
     defer queue.deinit();
 
     try queue.push(testing.allocator, try Message.init(testing.allocator, 1, "one"));
